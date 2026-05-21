@@ -1,23 +1,3 @@
-# Earth-Gym — open-source edition
-
-A reinforcement-learning environment for satellite mission planning, fully
-ported from the proprietary **AGI STK** engine to open-source Python libraries.
-
----
-
-## What changed
-
-| Concern | Original (STK) | This version (OSS) |
-|---|---|---|
-| Orbit propagation | STK J2Perturbation / TwoBody | `OrbitalPropagator` (TwoBody / J2 / J4 secular) |
-| Frame transforms | STK coordinate-system data providers | `spiceypy` + WGS-84 analytic fallback |
-| Sensor visibility | `sensor.GetAccessToObject()` + AER | `AccessChecker` geometric cone check |
-| Coverage grid | STK CoverageDefinition + FigureOfMerit | `GridManager` vectorised lat/lon sweep |
-| Time handling | STK scenario StartTime/StopTime | `DateManager` backed by SPICE str2et/et2utc |
-| Geodetic coords | STK LLA State data provider | SPICE recgeo / Bowring iterative geodetic |
-| License | AGI STK (commercial) | numpy · scipy · spiceypy (all open-source) |
-
----
 
 ## Installation
 
