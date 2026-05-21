@@ -1,0 +1,21 @@
+# ── Earth-Gym open-source dependencies ───────────────────────────────────────
+# Install with:  pip install -r requirements.txt
+
+# ── Core scientific stack ─────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+
+# ── SPICE / astrodynamics ─────────────────────────────────────────────────────
+# spiceypy wraps NASA/NAIF SPICE for Python.
+# Kernels (~15 MB) are auto-downloaded on first run by coordinates.download_kernels().
+spiceypy>=6.0
+
+# ── Optional: higher-fidelity propagation ────────────────────────────────────
+# Uncomment sgp4 if you want to initialise orbits from TLE sets rather than
+# classical elements.  OrbitalPropagator does not use it by default.
+# sgp4>=2.22
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+psutil>=5.9        # memory reporting in main.py
