@@ -374,15 +374,32 @@ def plot_coverage_heatmap(
     bins:     int = 72,   # 5° × 5° grid
 ) -> None:
     """
-    2D histogram of all satellite positions (lat × lon) visited during training.
+    2D histogram of all sensor boresight ground intercept positions visited.
+
+    The heatmap shows WHERE THE SENSOR POINTED, not where the satellite was.
+    For i=0 the satellite is always at lat=0, but the agent pitches/rolls the
+    sensor to aim at off-equatorial targets — those boresight positions are
+    what matters for evaluating coverage quality.
+
+    Falls back to satellite sub-track positions if boresight data is absent.
     """
     if not records:
         return
 
-    # Dense interpolated positions — gives accurate coverage footprint
-    lats, lons, _ = _interpolate_ground_track(records, n_sub=20)
-    lats = np.array(lats)
-    lons = np.array(lons)
+    # Prefer boresight intercept (where sensor pointed) over sub-satellite point
+    has_boresight = any("boresight_lat" in r for r in records)
+    if has_boresight:
+        lats = np.array([r.get("boresight_lat", r.get("sat_lat", r.get("lat", 0.0)))
+                         for r in records])
+        lons = np.array([r.get("boresight_lon", r.get("sat_lon", r.get("lon", 0.0)))
+                         for r in records])
+        label = "Boresight intercept count"
+    else:
+        # Fallback: dense interpolated satellite track
+        lats_l, lons_l, _ = _interpolate_ground_track(records, n_sub=20)
+        lats = np.array(lats_l)
+        lons = np.array(lons_l)
+        label = "Visit count (satellite track)"
 
     h, xedges, yedges = np.histogram2d(
         lons, lats,
@@ -402,7 +419,7 @@ def plot_coverage_heatmap(
         cmap="hot_r",
         interpolation="bilinear",
     )
-    fig.colorbar(im, ax=ax, shrink=0.7, label="Visit count")
+    fig.colorbar(im, ax=ax, shrink=0.7, label=label)
 
     # Overlay target zones (last frame)
     tgt_lats, tgt_lons, tgt_pri = [], [], []
@@ -502,11 +519,19 @@ def plot_all(
     ax_b.set_title("Reward over time")
     ax_b.grid(linewidth=0.2, alpha=0.4)
 
-    # ── Panel C: coverage heatmap ─────────────────────────────────────────
+    # ── Panel C: coverage heatmap (boresight intercept positions) ────────────
     ax_c = fig.add_subplot(gs[1, 0])
-    all_lats_i, all_lons_i, _ = _interpolate_ground_track(records, n_sub=20)
-    all_lats = np.array(all_lats_i)
-    all_lons = np.array(all_lons_i)
+    has_bs = any("boresight_lat" in r for r in records)
+    if has_bs:
+        hl = np.array([r.get("boresight_lat", r.get("sat_lat", 0.0)) for r in records])
+        wl = np.array([r.get("boresight_lon", r.get("sat_lon", 0.0)) for r in records])
+        htitle = "Coverage heatmap — sensor boresight (all time)"
+    else:
+        hl_l, wl_l, _ = _interpolate_ground_track(records, n_sub=20)
+        hl, wl = np.array(hl_l), np.array(wl_l)
+        htitle = "Coverage heatmap — satellite track (all time)"
+    all_lats = hl
+    all_lons = wl
     h, _, _ = np.histogram2d(all_lons, all_lats, bins=[72, 36],
                               range=[[-180, 180], [-90, 90]])
     h = h.T
@@ -516,7 +541,7 @@ def plot_all(
                      aspect="auto", cmap="hot_r", interpolation="bilinear")
     fig.colorbar(im, ax=ax_c, shrink=0.8, pad=0.02)
     ax_c.set_xlabel("Lon (°)"); ax_c.set_ylabel("Lat (°)")
-    ax_c.set_title("Coverage heatmap (all time)")
+    ax_c.set_title(htitle)
 
     # ── Panel D: cumulative reward ────────────────────────────────────────
     ax_d = fig.add_subplot(gs[1, 1])

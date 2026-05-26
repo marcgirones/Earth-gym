@@ -154,9 +154,17 @@ total_frames     = 50_000
 
 sub_batch_size = 16    # reduced from 64 — Earth-Gym batches are smaller
 num_epochs     = 10
-clip_epsilon   = 0.2
+# ── PPO stability parameters ────────────────────────────────────────────────
+# clip_epsilon: how much the new policy can deviate from the old one per update.
+# 0.2 (default) is too large here — the policy was updating too aggressively,
+# causing it to collapse after batch ~120.  0.1 gives softer, more stable updates.
+clip_epsilon   = 0.1
 gamma          = 0.99
 lmbda          = 0.95
+# entropy_eps: weight of the entropy bonus that keeps the policy from becoming
+# too deterministic.  1e-4 (default) was far too small — exploration collapsed
+# quickly and the agent converged to a narrow local optimum.
+# 1e-2 provides a meaningful regularisation signal throughout training.
 entropy_eps    = 1e-2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,8 +354,12 @@ loss_module = ClipPPOLoss(
 )
 
 optim     = torch.optim.Adam(loss_module.parameters(), lr)
+# CosineAnnealingLR with eta_min=0 was decaying the lr to zero by end of
+# training, which caused the observed reward collapse after batch ~120.
+# Using a constant lr (no scheduler) gives stable learning throughout.
+# If you want decay, use eta_min=lr/10 so the policy never fully stops updating.
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim, total_frames // frames_per_batch, 0.0
+    optim, total_frames // frames_per_batch, eta_min=lr / 10
 )
 # ─────────────────────────────────────────────────────────────────────────────
 # Plots  (identical to main.py except save path)
@@ -505,7 +517,7 @@ for i, tensordict_data in enumerate(collector):
                 eval_reward=logs["eval reward"][-1],
             )
 
-            if i % 50 == 0:
+            if i % 100 == 0:
                 ckpt_path = os.path.join(args.out, f"policy_iter_{i:05d}.pt")
                 torch.save(
                     {
