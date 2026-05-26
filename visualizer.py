@@ -462,47 +462,57 @@ def plot_all(
         return
 
     rec = records[-max_track_pts:]
-    # Dense sub-step ground track for smooth sinusoidal display
-    lats, lons, rewards = _interpolate_ground_track(rec, n_sub=20)
+
+    # Satellite orbit track (dense sub-step interpolation)
+    sat_lats, sat_lons, rewards = _interpolate_ground_track(rec, n_sub=20)
+
+    # Boresight intercepts (one per telemetry record — where the sensor looked)
+    has_bs = any("boresight_lat" in r for r in rec)
+    bs_lats = [r.get("boresight_lat", r.get("sat_lat", 0.0)) for r in rec]
+    bs_lons = [r.get("boresight_lon", r.get("sat_lon", 0.0)) for r in rec]
+    bs_rew  = [r["reward"] for r in rec]
+
     steps   = [r["step"]   for r in records]
     all_rew = [r["reward"] for r in records]
 
     fig = plt.figure(figsize=(18, 10))
     gs  = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3)
 
-    # ── Panel A: ground track ─────────────────────────────────────────────
+    # ── Panel A: ground track + boresight scatter ─────────────────────────
     ax_a = fig.add_subplot(gs[0, 0])
-    colors = _reward_colors(rewards)
 
-    # Sub-satellite ground track — these ARE the satellite positions.
-    # Do NOT plot boresight intercepts here: when the sensor is slewed,
-    # the boresight can hit the Earth beyond the orbital inclination limit
-    # (e.g. lat=56° for an i=45° orbit), which looks like the satellite
-    # left its orbit even though it hasn't.
-    ax_a.scatter(lons, lats, c=colors, s=3, rasterized=True, zorder=2)
+    # 1. Satellite sub-track as a thin grey line (orbit reference)
+    ax_a.plot(sat_lons, sat_lats, color="steelblue", linewidth=0.6,
+              alpha=0.4, zorder=2, label="Satellite track")
 
-    # Footprint circle at last boresight position (correct sensor pointing)
+    # 2. Boresight intercepts as coloured dots (what the sensor actually saw)
+    bs_colors = _reward_colors(bs_rew)
+    ax_a.scatter(bs_lons, bs_lats, c=bs_colors, s=8,
+                 rasterized=True, zorder=3,
+                 label="Boresight intercept" if has_bs else "Sub-satellite")
+
+    # 3. Footprint circle at the most recent boresight position
     last_rec = rec[-1]
-    fp_lat = last_rec.get("boresight_lat", lats[-1])
-    fp_lon = last_rec.get("boresight_lon", lons[-1])
+    fp_lat = last_rec.get("boresight_lat", sat_lats[-1])
+    fp_lon = last_rec.get("boresight_lon", sat_lons[-1])
     fp_alt = last_rec.get("sat_alt", last_rec.get("alt", 1629.0))
     fp_deg = _footprint_radius_deg(fp_alt, cone_angle_deg)
     from matplotlib.patches import Circle as _Circle
     ax_a.add_patch(_Circle((fp_lon, fp_lat), fp_deg,
                             facecolor="gold", alpha=0.25,
                             edgecolor="darkorange", linewidth=1.0, zorder=4))
-    # Mark the boresight centre with a small cross (distinct from orbit dots)
     ax_a.plot(fp_lon, fp_lat, marker="+", color="darkorange",
               markersize=8, markeredgewidth=1.5, zorder=5,
-              label="Boresight centre")
+              label="Latest boresight")
 
     ax_a.set_xlim(-180, 180); ax_a.set_ylim(-90, 90)
     ax_a.set_xlabel("Lon (°)"); ax_a.set_ylabel("Lat (°)")
-    ax_a.set_title("Ground track (recent)\n"
-                   "dots = sub-satellite · ✛ = boresight · circle = footprint")
+    ax_a.set_title("Ground track + sensor boresight (recent)\n"
+                   "line = satellite orbit · dots = where sensor pointed · ✛ circle = latest footprint")
+    ax_a.legend(fontsize=7, loc="lower left")
     ax_a.grid(linewidth=0.2, alpha=0.4)
     sm = plt.cm.ScalarMappable(cmap=_REWARD_CMAP,
-                                norm=mcolors.Normalize(min(rewards), max(rewards)))
+                                norm=mcolors.Normalize(min(bs_rew), max(bs_rew)))
     sm.set_array([])
     fig.colorbar(sm, ax=ax_a, shrink=0.8, pad=0.02)
 
