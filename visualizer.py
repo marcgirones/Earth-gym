@@ -202,65 +202,77 @@ def plot_ground_track(
     records: list[dict],
     out_path: str,
     cone_angle_deg: float = 10.0,
-    max_points: int = 200,   # telemetry records; each expanded × n_sub sub-pts
+    max_points: int = 200,
 ) -> None:
     """
-    Satellite ground track on a world map, coloured by reward.
-    Uses sub-step propagator interpolation to produce a smooth sinusoidal band
-    rather than isolated dots (which look erratic when delta_time > T/4).
+    Ground track showing satellite orbit line + boresight intercept dots + targets.
     """
     if not records:
         return
 
     records = records[-max_points:]
-    # Dense interpolated track — 20 sub-samples per RL step
-    lats, lons, rewards = _interpolate_ground_track(records, n_sub=20)
-    alts    = [r.get("sat_alt", r.get("alt", 1629.0)) for r in records]
 
-    # Flatten targets across all records
-    tgt_lats, tgt_lons, tgt_pri = [], [], []
-    for r in records[-1:]:   # only last frame's targets
+    # Satellite orbit as thin reference line
+    sat_lats, sat_lons, _ = _interpolate_ground_track(records, n_sub=20)
+
+    # Boresight intercepts — where sensor actually pointed (one per step)
+    has_bs   = any("boresight_lat" in r for r in records)
+    bs_lats  = [r.get("boresight_lat", r.get("sat_lat", r.get("lat", 0.0))) for r in records]
+    bs_lons  = [r.get("boresight_lon", r.get("sat_lon", r.get("lon", 0.0))) for r in records]
+    bs_rews  = [r["reward"] for r in records]
+    bs_colors = _reward_colors(bs_rews)
+
+    alts = [r.get("sat_alt", r.get("alt", 1629.0)) for r in records]
+
+    # Accumulate ALL targets seen across ALL records (unique by lat/lon)
+    seen = {}
+    for r in records:
         for lat, lon, pri in r.get("targets", []):
-            tgt_lats.append(lat)
-            tgt_lons.append(lon)
-            tgt_pri.append(pri)
-
-    colors = _reward_colors(rewards)
+            key = (round(lat, 2), round(lon, 2))
+            if key not in seen or pri > seen[key]:
+                seen[key] = pri
+    tgt_lats = [k[0] for k in seen]
+    tgt_lons = [k[1] for k in seen]
+    tgt_pri  = [seen[k] for k in seen]
 
     if _CARTOPY:
         fig = plt.figure(figsize=(14, 7))
         ax  = fig.add_subplot(1, 1, 1,
                               projection=ccrs.Robinson(central_longitude=0))
         ax.set_global()
-        ax.add_feature(cfeature.LAND,   facecolor="#e8e4dc", zorder=0)
-        ax.add_feature(cfeature.OCEAN,  facecolor="#c9dce8", zorder=0)
+        ax.add_feature(cfeature.LAND,      facecolor="#e8e4dc", zorder=0)
+        ax.add_feature(cfeature.OCEAN,     facecolor="#c9dce8", zorder=0)
         ax.add_feature(cfeature.COASTLINE, linewidth=0.4, zorder=1)
         ax.add_feature(cfeature.BORDERS,   linewidth=0.3, zorder=1)
         ax.gridlines(linewidth=0.3, color="gray", alpha=0.4, linestyle="--")
 
-        ax.scatter(lons, lats, c=colors, s=4, transform=ccrs.PlateCarree(),
-                   zorder=2, rasterized=True)
+        # 1. Satellite orbit line
+        ax.plot(sat_lons, sat_lats, color="steelblue", linewidth=0.5,
+                alpha=0.35, transform=ccrs.PlateCarree(), zorder=2)
 
+        # 2. Boresight scatter
+        ax.scatter(bs_lons, bs_lats, c=bs_colors, s=6,
+                   transform=ccrs.PlateCarree(), zorder=3, rasterized=True)
+
+        # 3. Targets
         if tgt_lats:
             ax.scatter(tgt_lons, tgt_lats, c=tgt_pri, cmap="YlOrRd",
                        s=60, marker="*", edgecolors="k", linewidths=0.3,
-                       transform=ccrs.PlateCarree(), zorder=3,
-                       vmin=0, vmax=1, label="Targets")
+                       transform=ccrs.PlateCarree(), zorder=4,
+                       vmin=0, vmax=1, label="Targets (FoR history)")
 
-        # Footprint at last position — centred on boresight ground intercept,
-        # not the sub-satellite point, so it shows where the sensor actually points.
-        if lats:
-            last = records[-1]
-            fp_lat = last.get("boresight_lat", lats[-1])
-            fp_lon = last.get("boresight_lon", lons[-1])
+        # 4. Footprint at boresight
+        if bs_lats:
+            last   = records[-1]
+            fp_lat = last.get("boresight_lat", bs_lats[-1])
+            fp_lon = last.get("boresight_lon", bs_lons[-1])
             fp_deg = _footprint_radius_deg(alts[-1], cone_angle_deg)
             ax.tissot(rad_lon=fp_deg, rad_lat=fp_deg,
                       lons=[fp_lon], lats=[fp_lat],
                       n_samples=64, facecolor="gold", alpha=0.25,
-                      transform=ccrs.PlateCarree(), zorder=4)
+                      transform=ccrs.PlateCarree(), zorder=5)
 
     else:
-        # Fallback: plain equirectangular scatter
         fig, ax = plt.subplots(figsize=(14, 7))
         world = np.ones((180, 360, 3)) * 0.85
         ax.imshow(world, extent=[-180, 180, -90, 90], aspect="auto",
@@ -269,29 +281,39 @@ def plot_ground_track(
         ax.set_xlabel("Longitude (°)"); ax.set_ylabel("Latitude (°)")
         ax.grid(linewidth=0.3, alpha=0.4)
 
-        ax.scatter(lons, lats, c=colors, s=4, zorder=2, rasterized=True)
+        # 1. Satellite orbit line
+        ax.plot(sat_lons, sat_lats, color="steelblue", linewidth=0.5,
+                alpha=0.35, zorder=2)
 
+        # 2. Boresight scatter
+        ax.scatter(bs_lons, bs_lats, c=bs_colors, s=6, zorder=3, rasterized=True)
+
+        # 3. Targets
         if tgt_lats:
-            ax.scatter(tgt_lons, tgt_lats, c=tgt_pri, cmap="YlOrRd",
-                       s=80, marker="*", edgecolors="k", linewidths=0.3,
-                       zorder=3, vmin=0, vmax=1, label="Targets")
+            sc = ax.scatter(tgt_lons, tgt_lats, c=tgt_pri, cmap="YlOrRd",
+                            s=80, marker="*", edgecolors="k", linewidths=0.3,
+                            zorder=4, vmin=0, vmax=1)
+            fig.colorbar(sc, ax=ax, shrink=0.4, pad=0.01, label="Target priority")
 
-        # Footprint circle — centred on boresight intercept
-        if lats:
-            last  = records[-1]
-            fp_lat = last.get("boresight_lat", lats[-1])
-            fp_lon = last.get("boresight_lon", lons[-1])
+        # 4. Footprint at boresight
+        if bs_lats:
+            last   = records[-1]
+            fp_lat = last.get("boresight_lat", bs_lats[-1])
+            fp_lon = last.get("boresight_lon", bs_lons[-1])
             fp_deg = _footprint_radius_deg(alts[-1], cone_angle_deg)
             circ   = Circle((fp_lon, fp_lat), fp_deg,
                             facecolor="gold", alpha=0.3, edgecolor="darkorange",
-                            linewidth=1.2, zorder=4)
+                            linewidth=1.2, zorder=5)
             ax.add_patch(circ)
 
-    # Colorbar
     sm = plt.cm.ScalarMappable(cmap=_REWARD_CMAP,
-                                norm=mcolors.Normalize(min(rewards), max(rewards)))
+                                norm=mcolors.Normalize(min(bs_rews), max(bs_rews)))
     sm.set_array([])
     fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.02, label="Reward")
+    ax.set_title(
+        "Ground track  ·  line = satellite orbit  ·  "
+        "dots = boresight intercept (coloured by reward)  ·  ★ = FoR targets"
+    )
 
     step = records[-1].get("step", "?")
     ax.set_title(f"Satellite ground track — batch {step}  "
@@ -421,6 +443,21 @@ def plot_coverage_heatmap(
     )
     fig.colorbar(im, ax=ax, shrink=0.7, label=label)
 
+    # Overlay all targets seen across records
+    seen = {}
+    for r in records:
+        for tlat, tlon, tpri in r.get("targets", []):
+            key = (round(tlat, 2), round(tlon, 2))
+            if key not in seen or tpri > seen[key]:
+                seen[key] = tpri
+    if seen:
+        t_lats = [k[0] for k in seen]
+        t_lons = [k[1] for k in seen]
+        t_pri  = [seen[k] for k in seen]
+        ax.scatter(t_lons, t_lats, c=t_pri, cmap="cool",
+                   s=25, marker="*", edgecolors="white", linewidths=0.2,
+                   zorder=5, vmin=0, vmax=1, alpha=0.7, label="Targets")
+
     # Overlay target zones (last frame)
     tgt_lats, tgt_lons, tgt_pri = [], [], []
     for r in records[-1:]:
@@ -505,6 +542,21 @@ def plot_all(
               markersize=8, markeredgewidth=1.5, zorder=5,
               label="Latest boresight")
 
+    # 4. Targets — accumulated across all recent records
+    seen_tgts = {}
+    for r in rec:
+        for tlat, tlon, tpri in r.get("targets", []):
+            key = (round(tlat, 2), round(tlon, 2))
+            if key not in seen_tgts or tpri > seen_tgts[key]:
+                seen_tgts[key] = tpri
+    if seen_tgts:
+        t_lats = [k[0] for k in seen_tgts]
+        t_lons = [k[1] for k in seen_tgts]
+        t_pri  = [seen_tgts[k] for k in seen_tgts]
+        ax_a.scatter(t_lons, t_lats, c=t_pri, cmap="YlOrRd",
+                     s=40, marker="*", edgecolors="k", linewidths=0.2,
+                     zorder=4, vmin=0, vmax=1, label="FoR targets")
+
     ax_a.set_xlim(-180, 180); ax_a.set_ylim(-90, 90)
     ax_a.set_xlabel("Lon (°)"); ax_a.set_ylabel("Lat (°)")
     ax_a.set_title("Ground track + sensor boresight (recent)\n"
@@ -550,6 +602,22 @@ def plot_all(
     im = ax_c.imshow(h, origin="lower", extent=[-180, 180, -90, 90],
                      aspect="auto", cmap="hot_r", interpolation="bilinear")
     fig.colorbar(im, ax=ax_c, shrink=0.8, pad=0.02)
+
+    # Overlay accumulated targets on heatmap
+    seen_c = {}
+    for r in records:
+        for tlat, tlon, tpri in r.get("targets", []):
+            key = (round(tlat, 2), round(tlon, 2))
+            if key not in seen_c or tpri > seen_c[key]:
+                seen_c[key] = tpri
+    if seen_c:
+        c_lats = [k[0] for k in seen_c]
+        c_lons = [k[1] for k in seen_c]
+        c_pri  = [seen_c[k] for k in seen_c]
+        ax_c.scatter(c_lons, c_lats, c=c_pri, cmap="cool",
+                     s=20, marker="*", edgecolors="white", linewidths=0.2,
+                     zorder=5, vmin=0, vmax=1, alpha=0.7)
+
     ax_c.set_xlabel("Lon (°)"); ax_c.set_ylabel("Lat (°)")
     ax_c.set_title(htitle)
 

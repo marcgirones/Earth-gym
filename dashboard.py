@@ -72,7 +72,7 @@ parser.add_argument("--port",      default=8050,      type=int)
 parser.add_argument("--host",      default="0.0.0.0")
 parser.add_argument("--trail",     default=500,        type=int,
                     help="Number of past positions to show on globe")
-parser.add_argument("--refresh",   default=30,          type=int,
+parser.add_argument("--refresh",   default=10,          type=int,
                     help="Dashboard auto-refresh interval (seconds)")
 parser.add_argument("--cone",      default=10.0,       type=float,
                     help="Sensor cone half-angle (deg) — must match config")

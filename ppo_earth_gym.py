@@ -96,7 +96,7 @@ parser.add_argument("--out",       default="output/",
                     help="Output folder for plots and reward logs")
 parser.add_argument("--host",      default="localhost")
 parser.add_argument("--port",      default=5555, type=int)
-parser.add_argument("--delta-time",default=5553.5, type=float,
+parser.add_argument("--delta-time",default=71.2645, type=float,
                     help="Seconds per env step (default ≈ one ISS orbital period)")
 parser.add_argument("--no-server", action="store_true",
                     help="Skip launching the server (assumes it is already running)")
@@ -453,10 +453,15 @@ for i, tensordict_data in enumerate(collector):
     # ── Log telemetry record (one per batch) ──────────────────────────────
     # Decodes the last observation in the batch back to raw feature values
     # so the ground track and attitude state are human-readable.
+    # Snapshot the raw state RIGHT NOW, before eval rollout overwrites it.
+    # The eval runs env.step() 100 times internally which mutates
+    # _gym_env.last_raw_state — so we must save it here.
+    training_raw_state = dict(_gym_env.last_raw_state)
+
     telemetry.log_step(
         step=i,
         obs=_obs_to_dict(tensordict_data),
-        raw_state=_gym_env.last_raw_state,
+        raw_state=training_raw_state,
         reward=batch_reward,
     )
     cum_reward_str = (
@@ -471,15 +476,8 @@ for i, tensordict_data in enumerate(collector):
     if i % 10 == 0:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             eval_rollout = env.rollout(100, policy_module)
-
-            ## MODIFICATION 8 — Reduce rollout horizon for Earth-Gym
-            #
-            # In main.py:
-            #     eval_rollout = env.rollout(1000, policy_module)
-            #
-            # 1000 steps × delta_time (≈ 5553 s) = ~64 simulated days per eval.
-            # Use 100 steps instead (≈ 6.4 simulated days), which is both
-            # faster and fits within the default 7-hour scenario window.
+            # NOTE: _gym_env.last_raw_state is now at the END of the eval
+            # rollout — do NOT use it for telemetry here.
 
             logs["eval reward"].append(
                 eval_rollout["next", "reward"].mean().item()
@@ -497,27 +495,18 @@ for i, tensordict_data in enumerate(collector):
             )
             del eval_rollout
 
-            ## MODIFICATION 9 — Video recording is not applicable to Earth-Gym
-            #
-            # In main.py:
-            #     if i % 100 == 0:
-            #         video_env = gym.make("HalfCheetah-v5", render_mode="rgb_array")
-            #         video_env = RecordVideo(...)
-            #         ...
-            #
-            # Earth-Gym has no render_mode / video output.
-            # Replace with a checkpoint save and a ground-track log instead.
-
-            # ── Tag the last telemetry record with the eval reward ──────────
+            # ── Tag the TRAINING-step telemetry record with the eval reward.
+            # Re-use training_raw_state (captured before eval) so lat/lon/alt
+            # are still the training position, not wherever eval ended up.
             telemetry.log_step(
                 step=i,
                 obs=_obs_to_dict(tensordict_data),
-                raw_state=_gym_env.last_raw_state,
+                raw_state=training_raw_state,
                 reward=logs["reward"][-1],
                 eval_reward=logs["eval reward"][-1],
             )
 
-            if i % 100 == 0:
+            if i % 50 == 0:
                 ckpt_path = os.path.join(args.out, f"policy_iter_{i:05d}.pt")
                 torch.save(
                     {
