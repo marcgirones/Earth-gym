@@ -3,7 +3,7 @@
         "debug": false,
         "scenario_name": "PPO",
         "start_time": "1 Jan 2000 00:00:00.000",
-        "stop_time":  "1 Jan 2000 01:58:46.450",
+        "stop_time":  "1 Jan 2000 09:53:52.250",
         "propagator": "TwoBody",
         "deep_training": true
     },
@@ -19,7 +19,7 @@
         "priority_weight": 1,
         "grid_weight": 0.05,
         "grid_decay": 30,
-        "slew_weight": 0.05
+        "slew_weight": 0.005
     },
     "agents": [
         {

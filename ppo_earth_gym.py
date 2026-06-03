@@ -32,6 +32,7 @@ import os
 import sys
 import warnings
 from collections import defaultdict
+import numpy as np
 
 warnings.filterwarnings("ignore")
 
@@ -96,7 +97,7 @@ parser.add_argument("--out",       default="output/",
                     help="Output folder for plots and reward logs")
 parser.add_argument("--host",      default="localhost")
 parser.add_argument("--port",      default=5555, type=int)
-parser.add_argument("--delta-time",default=71.2645, type=float,
+parser.add_argument("--delta-time", default=50, type=float,
                     help="Seconds per env step (default ≈ one ISS orbital period)")
 parser.add_argument("--no-server", action="store_true",
                     help="Skip launching the server (assumes it is already running)")
@@ -132,7 +133,7 @@ device     = (
     else torch.device("cpu")
 )
 num_cells      = 256
-lr             = 3e-4
+lr             = 1e-3
 max_grad_norm  = 1.0
 
 ## MODIFICATION 2 — Reduce frames_per_batch and total_frames for Earth-Gym
@@ -150,7 +151,7 @@ max_grad_norm  = 1.0
 # Increase total_frames once you confirm the training loop runs correctly.
 #
 frames_per_batch = 64
-total_frames     = 50_000
+total_frames     = 300_000
 
 sub_batch_size = 16    # reduced from 64 — Earth-Gym batches are smaller
 num_epochs     = 10
@@ -158,14 +159,14 @@ num_epochs     = 10
 # clip_epsilon: how much the new policy can deviate from the old one per update.
 # 0.2 (default) is too large here — the policy was updating too aggressively,
 # causing it to collapse after batch ~120.  0.1 gives softer, more stable updates.
-clip_epsilon   = 0.1
+clip_epsilon   = 0.2
 gamma          = 0.99
 lmbda          = 0.95
 # entropy_eps: weight of the entropy bonus that keeps the policy from becoming
 # too deterministic.  1e-4 (default) was far too small — exploration collapsed
 # quickly and the agent converged to a narrow local optimum.
 # 1e-2 provides a meaningful regularisation signal throughout training.
-entropy_eps    = 1e-2
+entropy_eps    = 1e-1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [B]  Environment construction
@@ -367,17 +368,24 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 def plotter(logs):
     plt.figure(figsize=(10, 10))
     plt.subplot(2, 2, 1)
-    plt.plot(logs["reward"])
+    rewards = np.array(logs["reward"])
+    plt.plot(rewards, alpha=0.3, color="tab:blue", label="Raw")
+    rewards_smooth = np.convolve(rewards, np.ones(50) / 50, mode="valid")
+    plt.plot(np.arange(len(rewards_smooth)) + 49, rewards_smooth,color="tab:blue",linewidth=2,label="Moving Avg (50)")
     plt.title("Training rewards (average)")
     plt.subplot(2, 2, 2)
-    plt.plot(logs["step_count"])
-    plt.title("Max step count (training)")
+    #plt.plot(logs["step_count"])
+    #plt.title("Max step count (training)")
+    plt.plot(logs["loss_value"])
+    plt.title("Loss: value")
     plt.subplot(2, 2, 3)
     plt.plot(logs["eval reward (sum)"])
     plt.title("Return (evaluation)")
     plt.subplot(2, 2, 4)
-    plt.plot(logs["eval step_count"])
-    plt.title("Max step count (evaluation)")
+    #plt.plot(logs["eval step_count"])
+    #plt.title("Max step count (evaluation)")
+    plt.plot(logs["loss_policy"])
+    plt.title("Loss: policy")
     plt.tight_layout()
     plt.savefig("graphs/ppo_earth_gym_results.png")
     print("[Done] Training complete. Plot saved to graphs/ppo_earth_gym_results.png")
@@ -448,6 +456,8 @@ for i, tensordict_data in enumerate(collector):
 
     batch_reward = tensordict_data["next", "reward"].mean().item()
     logs["reward"].append(batch_reward)
+    logs["loss_value"].append(loss_vals["loss_critic"].item())
+    logs["loss_policy"].append(loss_vals["loss_objective"].item())
     pbar.update(tensordict_data.numel())
 
     # ── Log telemetry record (one per batch) ──────────────────────────────
@@ -473,7 +483,7 @@ for i, tensordict_data in enumerate(collector):
     logs["lr"].append(optim.param_groups[0]["lr"])
     lr_str = f"lr policy: {logs['lr'][-1]: 4.4f}"
 
-    if i % 10 == 0:
+    if i % 50 == 0:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             eval_rollout = env.rollout(100, policy_module)
             # NOTE: _gym_env.last_raw_state is now at the END of the eval
@@ -495,6 +505,15 @@ for i, tensordict_data in enumerate(collector):
             )
             del eval_rollout
 
+            # ── Reset env to episode start after eval ──────────────────────
+            # The eval rollout consumes an unpredictable number of steps
+            # (it may cross episode boundaries), leaving the server at an
+            # arbitrary simulation time.  Without this reset, consecutive
+            # training batches start from different points in the episode,
+            # causing the large longitude jumps seen in telemetry.
+            # Resetting here guarantees every training batch starts from t=0.
+            env.reset()
+
             # ── Tag the TRAINING-step telemetry record with the eval reward.
             # Re-use training_raw_state (captured before eval) so lat/lon/alt
             # are still the training position, not wherever eval ended up.
@@ -506,7 +525,7 @@ for i, tensordict_data in enumerate(collector):
                 eval_reward=logs["eval reward"][-1],
             )
 
-            if i % 50 == 0:
+            if i % 100 == 0:
                 ckpt_path = os.path.join(args.out, f"policy_iter_{i:05d}.pt")
                 torch.save(
                     {

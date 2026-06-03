@@ -72,7 +72,7 @@ parser.add_argument("--port",      default=8050,      type=int)
 parser.add_argument("--host",      default="0.0.0.0")
 parser.add_argument("--trail",     default=500,        type=int,
                     help="Number of past positions to show on globe")
-parser.add_argument("--refresh",   default=10,          type=int,
+parser.add_argument("--refresh",   default=5,          type=int,
                     help="Dashboard auto-refresh interval (seconds)")
 parser.add_argument("--cone",      default=10.0,       type=float,
                     help="Sensor cone half-angle (deg) — must match config")
@@ -179,11 +179,9 @@ def api_orbit():
     """
     Return a dense interpolated orbital ground track for the 3D globe.
 
-    The telemetry has one record per RL step (delta_time = 890 s = T/8).
-    That gives only 8 dots per orbit — far too sparse for a smooth 3D trail.
-    This endpoint re-runs the propagator between consecutive telemetry records
-    at N_SUB sub-steps each, producing ~160 points per orbit so CesiumJS can
-    draw a smooth sinusoidal polyline.
+    The telemetry has one record per RL step (delta_time = T/100 ≈ 71.26 s).
+    That gives 100 dots per orbit — good for training, but sub-step interpolation
+    (N_SUB=20) produces 2000 points per orbit for a perfectly smooth 3D trail.
 
     Returns a list of {lat, lon, alt_m, reward} dicts, one per sub-sample.
     """
@@ -212,7 +210,15 @@ def api_orbit():
         et0      = stk_date_to_et(general["start_time"])
         prop     = make_propagator(ag_flat, general.get("propagator", "TwoBody"), et0)
         N_SUB    = 20
-        DELTA    = 890.1   # must match earth_gym_env delta_time
+        # Derive DELTA from scenario window and number of steps in telemetry.
+        # This automatically picks up any change to delta_time without needing
+        # to hardcode the value here.
+        stop_et  = stk_date_to_et(general["stop_time"])
+        ep_dur   = stop_et - et0  # one episode in seconds
+        # step count = max step in telemetry (wraps per episode)
+        max_step = max((r.get("step", 0) for r in records), default=99)
+        n_steps  = max_step + 1  # 0-indexed
+        DELTA    = ep_dur / n_steps  # seconds per RL step
 
         rewards  = [r["reward"] for r in records]
         r_min, r_max = min(rewards), max(rewards)

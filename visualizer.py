@@ -173,7 +173,14 @@ def _interpolate_ground_track(
         # Each record has "ts" (wall-clock) but NOT simulation time.
         # We reconstruct simulation time from step index and delta_time.
         # Read delta_time from the config if available, fall back to 890.1s.
-        delta_time = 890.1   # default T/8
+        # Derive delta_time from scenario window and max step in records.
+        # This automatically picks up any change to the config.
+        from scripts.coordinates import stk_date_to_et as _s2et
+        _et0      = _s2et(general["start_time"])
+        _stop_et  = _s2et(general["stop_time"])
+        _ep_dur   = _stop_et - _et0
+        _max_step = max((r.get("step", 0) for r in records), default=99)
+        delta_time = _ep_dur / (_max_step + 1)
 
         lats, lons, rews = [], [], []
         for rec in records:

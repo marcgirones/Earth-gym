@@ -135,7 +135,7 @@ class EarthGymEnv(gym.Env):
         # on opposite sides of the orbit and the lat/lon sequence look random.
         # New value: T/8 = 890.1s → 8 agent decisions per orbit.
         # 400-step episode = 50 complete orbits ≈ 4.1 simulated days.
-        delta_time:      float = 71.2645, # seconds
+        delta_time:      float = 50,  # T/100 ≈ 71.26 s → 100 steps per orbit
         obs_features:    list[str] | None = None,
         action_features: list[str] | None = None,
         action_limit:    float = DEFAULT_ACTION_LIMIT,
