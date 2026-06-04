@@ -64,6 +64,13 @@ class TelemetryLogger:
         self._handle = open(self._path, "w", buffering=1)   # line-buffered
         self._frame  = 0
 
+        # Per-step evaluation telemetry — written to a separate file so it can
+        # be consumed by the dashboard without polluting the training stream.
+        self._eval_path   = Path(out_dir) / "eval_telemetry.jsonl"
+        self._eval_handle = open(self._eval_path, "w", buffering=1)
+        self._eval_episode = 0   # incremented at the start of each eval run
+        self._eval_frame   = 0   # global step counter across all eval runs
+
     # ── Writers ───────────────────────────────────────────────────────────
 
     def log_step(
@@ -135,14 +142,102 @@ class TelemetryLogger:
         self._write(record)
         self._frame += 1
 
+    def begin_eval_episode(self) -> int:
+        """
+        Call once at the start of each evaluation rollout.
+        Returns the episode index so the caller can pass it to log_eval_step.
+        """
+        self._eval_episode += 1
+        return self._eval_episode
+
+    def log_eval_step(
+        self,
+        eval_episode:   int,
+        eval_step:      int,
+        train_batch:    int,
+        raw_state:      dict,
+        obs:            dict,
+        reward:         float,
+        access_events:  list | None = None,
+    ) -> None:
+        """
+        Append one per-step record to eval_telemetry.jsonl.
+
+        Record schema
+        -------------
+        {
+          "eval_episode":  int,    which evaluation run this belongs to
+          "eval_step":     int,    step index within the episode (0-based)
+          "eval_frame":    int,    global step counter across all eval runs
+          "train_batch":   int,    training batch index that triggered this eval
+          "sim_time":      str,    simulation clock string from the server
+          "sat_lat":       float,
+          "sat_lon":       float,
+          "sat_alt":       float,
+          "pitch":         float,
+          "roll":          float,
+          "boresight_lat": float,
+          "boresight_lon": float,
+          "reward":        float,
+          "targets":       [[lat, lon, priority], ...],
+          "access_events": [{"name": str, "start_time": str,
+                             "stop_time": str, "elevation": float}, ...],
+          "ts":            float,  wall-clock UNIX timestamp
+        }
+        """
+        rs = raw_state or {}
+
+        sat_lat = float(rs.get("detic_lat",      obs.get("detic_lat",      0.0)))
+        sat_lon = float(rs.get("detic_lon",      obs.get("detic_lon",      0.0)))
+        sat_alt = float(rs.get("detic_alt",      obs.get("detic_alt",      0.0)))
+        boresight_lat = float(rs.get("boresight_lat", sat_lat))
+        boresight_lon = float(rs.get("boresight_lon", sat_lon))
+
+        targets = []
+        for n in range(1, 20):
+            if f"lat_{n}" not in obs:
+                break
+            targets.append([
+                round(obs[f"lat_{n}"],              4),
+                round(obs[f"lon_{n}"],              4),
+                round(obs.get(f"priority_{n}", 0.0), 4),
+            ])
+
+        record = {
+            "eval_episode":  eval_episode,
+            "eval_step":     eval_step,
+            "eval_frame":    self._eval_frame,
+            "train_batch":   train_batch,
+            "sim_time":      rs.get("sim_time", ""),
+            "sat_lat":       round(sat_lat,        5),
+            "sat_lon":       round(sat_lon,        5),
+            "sat_alt":       round(sat_alt,        3),
+            "pitch":         round(obs.get("pitch", 0.0), 3),
+            "roll":          round(obs.get("roll",  0.0), 3),
+            "boresight_lat": round(boresight_lat,  5),
+            "boresight_lon": round(boresight_lon,  5),
+            "reward":        round(float(reward),  6),
+            "targets":       targets,
+            "access_events": access_events or [],
+            "ts":            round(time.time(),    3),
+        }
+        self._write_eval(record)
+        self._eval_frame += 1
+
     def _write(self, record: dict) -> None:
         with self._lock:
             self._handle.write(json.dumps(record) + "\n")
+
+    def _write_eval(self, record: dict) -> None:
+        with self._lock:
+            self._eval_handle.write(json.dumps(record) + "\n")
 
     def close(self) -> None:
         with self._lock:
             self._handle.flush()
             self._handle.close()
+            self._eval_handle.flush()
+            self._eval_handle.close()
 
     def __del__(self):
         try:

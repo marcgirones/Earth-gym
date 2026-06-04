@@ -272,7 +272,22 @@ class AttitudeManager:
         """
         Increment pitch and roll using body-fixed composition of rotations.
         Order: roll (x-axis), pitch (y-axis), yaw=0.
+
+        Robustness notes
+        ----------------
+        * Non-finite deltas (NaN / Inf from a diverging PPO network) are
+          silently replaced with 0 so the server never crashes mid-episode.
+        * After thousands of quaternion multiplications, floating-point drift
+          can make the stored quaternion slightly non-unit.  scipy normalises
+          on construction, but we re-normalise the composed result explicitly
+          to prevent gradual accumulation from ever producing a zero-norm quat.
         """
+        # Clamp non-finite inputs rather than crashing
+        if not np.isfinite(delta_pitch):
+            delta_pitch = 0.0
+        if not np.isfinite(delta_roll):
+            delta_roll = 0.0
+
         current_rot     = R.from_euler("xyz",
                                        [self.current_roll,
                                         self.current_pitch, 0.0],
@@ -280,7 +295,15 @@ class AttitudeManager:
         incremental_rot = R.from_euler("xyz",
                                        [delta_roll, delta_pitch, 0.0],
                                        degrees=True)
-        new_rot         = current_rot * incremental_rot
+        new_rot   = current_rot * incremental_rot
+        # Re-normalise to prevent quaternion drift over long episodes
+        q         = new_rot.as_quat()
+        q_norm    = np.linalg.norm(q)
+        if q_norm < 1e-10:
+            # Degenerate — reset to identity rather than crash
+            new_rot = R.identity()
+        else:
+            new_rot = R.from_quat(q / q_norm)
         new_euler       = new_rot.as_euler("xyz", degrees=True)
         self.current_roll  = float(new_euler[0])
         self.current_pitch = float(new_euler[1])
@@ -428,23 +451,35 @@ class AccessChecker:
         r_diff_mag = np.linalg.norm(r_diff)
         r_diff_hat = r_diff / r_diff_mag
 
-        # 1. Nadir angle: angle between nadir direction and satellite→target
-        cos_nadir   = np.clip(np.dot(nadir_hat, r_diff_hat), -1.0, 1.0)
-        nadir_angle = float(np.degrees(np.arccos(cos_nadir)))
+        # 1. Elevation of the satellite as seen from the target (true horizon check).
+        #
+        #    The previous code used:
+        #        rho = arccos(RT / |r_sat|)          (Earth limb half-angle)
+        #        nadir_angle = angle(nadir, sat→tgt)
+        #        reject if nadir_angle > rho
+        #
+        #    This is INCORRECT for surface targets.  nadir_angle > rho means the
+        #    target direction falls outside the Earth-disk cone as seen from the
+        #    satellite — but a surface target can be well above its own local horizon
+        #    even when its direction from the satellite lies outside that cone.
+        #    The practical result: targets beyond ~12° latitude were rejected even
+        #    though the true geometric limit (el_from_target = 0) is ~37° for a
+        #    1629 km orbit.
+        #
+        #    Correct check: is the satellite above the target's local horizon?
+        #        r_tgt_up  = r_tgt / |r_tgt|   (local vertical at target)
+        #        el = arcsin( dot((r_sat - r_tgt)/|r_sat - r_tgt|, r_tgt_up) )
+        #        visible iff el >= 0
+        #
+        #    This is equivalent to the ray sat→target not intersecting the Earth,
+        #    and is the standard AER elevation used in STK.
+        r_tgt_up      = r_tgt_eci / np.linalg.norm(r_tgt_eci)   # local up at target
+        sat_from_tgt  = -r_diff / r_diff_mag                      # target → satellite
+        sin_el        = float(np.clip(np.dot(sat_from_tgt, r_tgt_up), -1.0, 1.0))
+        elevation_deg = float(np.degrees(np.arcsin(sin_el)))      # −90…+90 deg
 
-        # 2. Earth limb half-angle from satellite: rho = arccos(RT / |r_sat|)
-        rho = float(np.degrees(np.arccos(np.clip(RT / r_sat_mag, 0.0, 1.0))))
-
-        # 3. Elevation normalised to [0°, 90°] to match STK AER convention:
-        #    0° = target at Earth limb, 90° = target directly below satellite.
-        #    BUG FIX 4: the raw (rho - nadir_angle) only reaches ~37° for a
-        #    typical LEO orbit, capping f_theta = sin(elevation) at ~0.61.
-        #    Normalising to the full [0°, 90°] range lets f_theta reach 1.0
-        #    for nadir passes.
-        elevation_deg = 90.0 * (rho - nadir_angle) / rho if rho > 0.0 else 0.0
-
-        # 4. Horizon check: occluded when nadir_angle > rho
-        if nadir_angle > rho:
+        # 2. Horizon check: target is occluded when satellite is below target's horizon
+        if elevation_deg < 0.0:
             return False, elevation_deg
 
         # 5. Sensor cone check
@@ -1004,6 +1039,11 @@ class Rewarder:
         r = 0.0
         for diff in features_mg.action:
             value    = features_mg.action[diff]
+            # Second-line NaN guard: features_mg.action should always be clean
+            # after the sanitisation in _update_agent, but defend here too so
+            # a future code path cannot bypass the upstream check.
+            if not np.isfinite(value):
+                value = 0.0
             movement = abs(value)
 
             if diff in ("d_az", "d_el"):

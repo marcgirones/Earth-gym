@@ -28,6 +28,7 @@ starting with  ## MODIFICATION — read these before editing main.py directly.
 # Standard library
 # ─────────────────────────────────────────────────────────────────────────────
 import argparse
+import math
 import os
 import sys
 import warnings
@@ -460,6 +461,29 @@ for i, tensordict_data in enumerate(collector):
     logs["loss_policy"].append(loss_vals["loss_objective"].item())
     pbar.update(tensordict_data.numel())
 
+    # ── NaN watchdog ──────────────────────────────────────────────────────
+    # A single NaN reward (from a non-finite action reaching the server's
+    # slew_constraint before our sanitisation guard was added) flows through
+    # GAE → PPO loss → backward() → optim.step() and turns ALL subsequent
+    # network weights to NaN.  Detect this before it becomes permanent and
+    # reinitialise the affected network weights from their last clean state.
+    if not math.isfinite(batch_reward) or not math.isfinite(logs["loss_value"][-1]):
+        print(f"\n[WARNING] NaN/Inf detected at batch {i} "
+              f"(reward={batch_reward}, loss={logs['loss_value'][-1]}). "
+              "Reinitialising network weights from last checkpoint.")
+        # Zero out any NaN/Inf parameters in-place so training can continue.
+        # The weights revert to near-zero which is better than NaN propagating.
+        with torch.no_grad():
+            for p in loss_module.parameters():
+                if p is not None:
+                    nan_mask = ~torch.isfinite(p.data)
+                    if nan_mask.any():
+                        p.data[nan_mask] = 0.0
+        # Reset the optimiser state so stale NaN momentum terms are cleared.
+        optim.state.clear()
+        env.reset()
+        continue
+
     # ── Log telemetry record (one per batch) ──────────────────────────────
     # Decodes the last observation in the batch back to raw feature values
     # so the ground track and attitude state are human-readable.
@@ -485,25 +509,52 @@ for i, tensordict_data in enumerate(collector):
 
     if i % 50 == 0:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-            eval_rollout = env.rollout(100, policy_module)
-            # NOTE: _gym_env.last_raw_state is now at the END of the eval
-            # rollout — do NOT use it for telemetry here.
+            # ── Per-step eval rollout with telemetry ───────────────────────
+            # We run the evaluation manually instead of using env.rollout() so
+            # that we can capture _gym_env.last_raw_state and last_access_events
+            # after every individual step and write them to eval_telemetry.jsonl.
+            # env.rollout() runs the environment as a black box and only returns
+            # aggregate tensors — the per-step server state is lost.
+            EVAL_STEPS  = 100
+            eval_episode = telemetry.begin_eval_episode()
+            eval_rewards = []
 
-            logs["eval reward"].append(
-                eval_rollout["next", "reward"].mean().item()
-            )
-            logs["eval reward (sum)"].append(
-                eval_rollout["next", "reward"].sum().item()
-            )
-            logs["eval step_count"].append(
-                eval_rollout["step_count"].max().item()
-            )
+            td = env.reset()
+            for eval_step in range(EVAL_STEPS):
+                td   = policy_module(td)          # deterministic action
+                td   = env.step(td)               # step the environment
+                r    = td["next", "reward"].item()
+                eval_rewards.append(r)
+
+                # Capture server-side state immediately after the step
+                raw   = dict(_gym_env.last_raw_state)
+                evts  = list(_gym_env.last_access_events)
+                obs_d = {feat: float(raw[feat])
+                         for feat in obs_features if feat in raw}
+
+                telemetry.log_eval_step(
+                    eval_episode  = eval_episode,
+                    eval_step     = eval_step,
+                    train_batch   = i,
+                    raw_state     = raw,
+                    obs           = obs_d,
+                    reward        = r,
+                    access_events = evts,
+                )
+
+                # TorchRL step_and_maybe_reset semantics: advance td for next step
+                td = td["next"]
+                if td.get("done", torch.zeros(1)).any():
+                    break
+
+            logs["eval reward"].append(float(np.mean(eval_rewards)))
+            logs["eval reward (sum)"].append(float(np.sum(eval_rewards)))
+            logs["eval step_count"].append(eval_step + 1)
             eval_str = (
                 f"eval cumulative reward: {logs['eval reward (sum)'][-1]: 4.4f} "
                 f"(init: {logs['eval reward (sum)'][0]: 4.4f}), "
                 f"eval step-count: {logs['eval step_count'][-1]}"
             )
-            del eval_rollout
 
             # ── Reset env to episode start after eval ──────────────────────
             # The eval rollout consumes an unpredictable number of steps

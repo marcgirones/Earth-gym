@@ -19,7 +19,7 @@
         "priority_weight": 1,
         "grid_weight": 0.05,
         "grid_decay": 30,
-        "slew_weight": 0.005
+        "slew_weight": 0.00005
     },
     "agents": [
         {
@@ -53,7 +53,7 @@
                 "initial_azimuth": 0.0,
                 "initial_elevation": 90.0
             },
-            "states_features": ["pitch", "roll", "detic_lat", "detic_lon", "detic_alt", "lat_5", "lon_5", "priority_5"],
+            "states_features": ["pitch", "roll", "detic_lat", "detic_lon", "detic_alt", "lat_1", "lon_1", "priority_1", "lat_2", "lon_2", "priority_2", "lat_3", "lon_3", "priority_3", "lat_4", "lon_4", "priority_4", "lat_5", "lon_5", "priority_5"],
             "actions_features": ["d_pitch", "d_roll"]
         }
     ]

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import numpy as np
 import psutil
 import pandas as pd
@@ -119,7 +120,12 @@ class Gym:
                 request_data["action"],
                 request_data["delta_time"],
             )
-            return json.dumps({"state": state, "reward": reward, "done": done})
+            return json.dumps({
+                "state":         state,
+                "reward":        reward,
+                "done":          done,
+                "access_events": getattr(self.env, "_last_access_events", []),
+            })
         elif cmd == "get_targets":
             # Return the full active target pool so the dashboard can
             # display all 100 targets on the globe, not just the 5 FoR slots.
@@ -159,14 +165,39 @@ class Gym:
         self.initialize_world(self.conf_file_path)
 
         while self.running:
-            data = conn.recv(1024).decode()
+            # ── Length-prefix framing ──────────────────────────────────────
+            # Read exactly 4 bytes to get the message length, then read
+            # exactly that many bytes for the JSON body.
+            # The old code used conn.recv(1024) which has two failure modes:
+            #   1. Back-to-back PPO requests arrive concatenated → json.loads
+            #      sees two JSON objects and raises JSONDecodeError.
+            #   2. A request larger than 1024 bytes is truncated → same error.
+            # The matching length-prefix send on the response side ensures the
+            # client's _recv_exactly loop always gets the complete message.
+            header = self._recv_exactly(conn, 4)
+            if not header:
+                break
+            length = struct.unpack(">I", header)[0]
+            data = self._recv_exactly(conn, length).decode()
             if not data:
                 break
             response = self.handle_request(data)
-            conn.sendall(response.encode())
+            resp_bytes = response.encode()
+            conn.sendall(struct.pack(">I", len(resp_bytes)) + resp_bytes)
 
         conn.close()
         server_socket.close()
+
+    @staticmethod
+    def _recv_exactly(conn, n: int) -> bytes:
+        """Read exactly n bytes from a connected socket."""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                return bytes(buf)   # connection closed — caller checks empty
+            buf.extend(chunk)
+        return bytes(buf)
 
     def is_shutdown(self) -> bool:
         return self.shutdown_complete
@@ -486,6 +517,19 @@ class SpiceEnvironment:
          features_mg, date_mg, attitude_mg) = sat
 
         if delta_time != 0.0:
+            # ── Sanitise action values before any downstream use ──────────
+            # The PPO network can output NaN or Inf values, especially during
+            # early training when weights are still unstable.  A single NaN
+            # that reaches features_mg.update_action() poisons
+            # slew_constraint() (via abs(NaN) = NaN), which then returns a NaN
+            # reward.  That NaN flows through GAE → PPO loss → backward() →
+            # optim.step(), turning ALL subsequent network weights to NaN and
+            # making the training run unrecoverable.
+            # Clamping here — before any manager sees the values — is the
+            # single correct place to break this cascade.
+            action = {k: (float(v) if np.isfinite(float(v)) else 0.0)
+                      for k, v in action.items()}
+
             # BUG FIX 1: attitude was updated once per key in the loop,
             # so a {d_pitch, d_roll} action applied update_roll_pitch twice,
             # doubling the rotation.  Collect attitude deltas separately and
@@ -506,12 +550,20 @@ class SpiceEnvironment:
                         "Use 'd_az', 'd_el', 'd_pitch', or 'd_roll'."
                     )
 
-            # Apply attitude update exactly once
+            # Apply attitude update exactly once.
+            # Guard against NaN / Inf coming from the PPO network (e.g. during
+            # early training when weights have not yet stabilised, or after a
+            # reward spike causes a large gradient step).  A non-finite delta
+            # produces a NaN quaternion whose norm is zero, which triggers
+            # scipy's "Found zero norm quaternions" ValueError.
             if any(k in action for k in ("d_pitch", "d_roll")):
-                attitude_mg.update_roll_pitch(
-                    action.get("d_pitch", 0.0),
-                    action.get("d_roll",  0.0),
-                )
+                d_pitch = float(action.get("d_pitch", 0.0))
+                d_roll  = float(action.get("d_roll",  0.0))
+                if not np.isfinite(d_pitch):
+                    d_pitch = 0.0
+                if not np.isfinite(d_roll):
+                    d_roll = 0.0
+                attitude_mg.update_roll_pitch(d_pitch, d_roll)
 
             date_mg.update_date_after(delta_time)
 
@@ -696,6 +748,8 @@ class SpiceEnvironment:
             attitude_mg.angle_domains,
             attitude_max_slew=attitude_mg.max_slew,
         )
+        # Cache for telemetry — step() reads this immediately after _get_reward
+        self._last_access_events = access_events
         return reward
 
     # ── State getter ──────────────────────────────────────────────────────
@@ -730,6 +784,15 @@ class SpiceEnvironment:
                     state["boresight_lon"] = float(bs_lon)
         except Exception:
             pass  # graceful — boresight fields simply absent if geometry fails
+
+        # Simulation time — ISO-style string so consumers don't need to know
+        # the STK epoch format.  Added here rather than in features_mg so it
+        # never pollutes the RL observation vector (it is only used by telemetry).
+        try:
+            state = dict(state)
+            state["sim_time"] = str(sat.date_mg.current_date)
+        except Exception:
+            pass
 
         return state if as_dict else list(state.values())
 

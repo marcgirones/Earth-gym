@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -178,6 +179,9 @@ class EarthGymEnv(gym.Env):
         # Raw (un-normalised) state dict from the last server response.
         # Read by ppo_earth_gym._obs_to_dict for accurate telemetry logging.
         self.last_raw_state: dict             = {}
+        # Access events returned by the server for the last step.
+        # Each entry: {"name": str, "start_time": str, "stop_time": str, "elevation": float}
+        self.last_access_events: list         = []
         # True after the very first reset() — distinguishes the initial
         # state fetch (delta_time=0) from subsequent episode resets (cmd=reset)
         self._episode_started: bool           = False
@@ -221,11 +225,30 @@ class EarthGymEnv(gym.Env):
             "after 20 attempts. Is the server running?"
         )
 
+    def _recv_exactly(self, n: int) -> bytes:
+        """Read exactly n bytes from the socket, blocking until all arrive."""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError(
+                    "Earth-Gym server closed the connection unexpectedly."
+                )
+            buf.extend(chunk)
+        return bytes(buf)
+
     def _send(self, payload: dict) -> dict:
-        raw = json.dumps(payload).encode()
-        self._sock.sendall(raw)
-        response = self._sock.recv(self.recv_buf)
-        return json.loads(response.decode())
+        # Length-prefix framing: every message is preceded by a 4-byte big-endian
+        # uint32 giving the byte length of the JSON body.  This guarantees that
+        # both sides read exactly one complete message per call, regardless of how
+        # TCP decides to segment the stream.  Without this, back-to-back sends
+        # from the PPO collector can arrive concatenated in a single recv(), or a
+        # large response can be split across two recv() calls — both cases cause
+        # json.JSONDecodeError on an empty or partial buffer.
+        data = json.dumps(payload).encode()
+        self._sock.sendall(struct.pack(">I", len(data)) + data)
+        length = struct.unpack(">I", self._recv_exactly(4))[0]
+        return json.loads(self._recv_exactly(length).decode())
 
     # ── State conversion ──────────────────────────────────────────────────────
 
@@ -326,7 +349,8 @@ class EarthGymEnv(gym.Env):
         done   = bool(resp.get("done", False))
 
         # Keep the raw server state for telemetry (bypasses ObservationNorm)
-        self.last_raw_state = state
+        self.last_raw_state     = state
+        self.last_access_events = resp.get("access_events") or []
 
         obs = self._state_to_obs(state) if state else (
             self._last_obs if self._last_obs is not None
