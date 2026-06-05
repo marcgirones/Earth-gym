@@ -104,11 +104,47 @@ parser.add_argument("--no-server", action="store_true",
                     help="Skip launching the server (assumes it is already running)")
 parser.add_argument("--cone",      default=10.0,  type=float,
                     help="Sensor cone half-angle (deg) — must match agents-configuration.json")
+parser.add_argument("--eval-steps", default=0, type=int,
+                    help="Steps per eval rollout. "
+                         "0 (default) = full episode derived from stop_time/delta_time. "
+                         "Set a smaller value to speed up training at the cost of "
+                         "shorter eval telemetry. "
+                         "Typical values: 142 = one orbit, 356 = half episode, "
+                         "713 = full episode for the default 9.9 h configuration.")
 args = parser.parse_args()
 
 os.makedirs(args.out,       exist_ok=True)
 os.makedirs("videos",       exist_ok=True)
 os.makedirs("graphs",       exist_ok=True)
+
+# ── Resolve eval_steps ────────────────────────────────────────────────────────
+# When --eval-steps 0 (default), derive the full episode length from the
+# simulation start/stop times in agents-configuration.json so the eval
+# always covers one complete orbit pass regardless of the delta_time chosen.
+def _episode_steps_from_conf(conf_path: str, delta_time: float) -> int:
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        conf = _json.loads(open(conf_path).read())
+        ep   = conf.get("episode", conf)
+        start_str = ep.get("start_time", "1 Jan 2000 00:00:00.000")
+        stop_str  = ep.get("stop_time",  "1 Jan 2000 09:53:52.250")
+        # Parse STK-style date "D Mon YYYY HH:MM:SS.mmm"
+        fmt = "%d %b %Y %H:%M:%S.%f"
+        t0  = _dt.strptime(start_str.strip(), fmt)
+        t1  = _dt.strptime(stop_str.strip(),  fmt)
+        duration_s = (t1 - t0).total_seconds()
+        return max(1, int(duration_s / delta_time))
+    except Exception as e:
+        print(f"[WARN] Could not derive episode length from config ({e}); "
+              "defaulting to 713 eval steps.")
+        return 713
+
+EVAL_STEPS = (args.eval_steps if args.eval_steps > 0
+              else _episode_steps_from_conf(args.conf, args.delta_time))
+print(f"[EarthGym] Eval steps per rollout: {EVAL_STEPS} "
+      f"(≈ {EVAL_STEPS * args.delta_time / 3600:.2f} h sim-time per eval)")
+
 
 # ── Launch server (unless --no-server) ───────────────────────────────────────
 server_proc = None
@@ -515,9 +551,12 @@ for i, tensordict_data in enumerate(collector):
             # after every individual step and write them to eval_telemetry.jsonl.
             # env.rollout() runs the environment as a black box and only returns
             # aggregate tensors — the per-step server state is lost.
-            EVAL_STEPS  = 100
             eval_episode = telemetry.begin_eval_episode()
             eval_rewards = []
+            # Write per-step telemetry only every 5 eval runs to avoid a
+            # massive eval_telemetry.jsonl.  The reward/loss logs still update
+            # every eval; only the detailed step-level JSON is throttled.
+            log_this_eval = (eval_episode % 5 == 0)
 
             td = env.reset()
             for eval_step in range(EVAL_STEPS):
@@ -529,18 +568,19 @@ for i, tensordict_data in enumerate(collector):
                 # Capture server-side state immediately after the step
                 raw   = dict(_gym_env.last_raw_state)
                 evts  = list(_gym_env.last_access_events)
-                obs_d = {feat: float(raw[feat])
-                         for feat in obs_features if feat in raw}
 
-                telemetry.log_eval_step(
-                    eval_episode  = eval_episode,
-                    eval_step     = eval_step,
-                    train_batch   = i,
-                    raw_state     = raw,
-                    obs           = obs_d,
-                    reward        = r,
-                    access_events = evts,
-                )
+                if log_this_eval:
+                    obs_d = {feat: float(raw[feat])
+                             for feat in obs_features if feat in raw}
+                    telemetry.log_eval_step(
+                        eval_episode  = eval_episode,
+                        eval_step     = eval_step,
+                        train_batch   = i,
+                        raw_state     = raw,
+                        obs           = obs_d,
+                        reward        = r,
+                        access_events = evts,
+                    )
 
                 # TorchRL step_and_maybe_reset semantics: advance td for next step
                 td = td["next"]
