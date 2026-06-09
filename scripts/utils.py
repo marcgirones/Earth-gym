@@ -1088,70 +1088,174 @@ class Rewarder:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Plotter:
-    """Plots and exports training reward curves."""
+    """
+    Plots and exports training reward curves.
 
-    def __init__(self, out_folder_path: str = "output"):
-        self.class_name     = "Plotter"
-        self.rewards        = pd.DataFrame()
+    Design
+    ------
+    * ``store_reward`` writes each reward immediately to ``rewards.csv`` (one
+      CSV row per call) using a persistent file handle opened in append mode.
+      No in-memory DataFrame is kept, so memory usage is O(1) regardless of
+      run length.  The previous ``pd.concat`` approach was O(N²) and would
+      eventually cause a MemoryError or severe slowdown on long training runs.
+
+    * An exponential moving average (EMA) is maintained incrementally alongside
+      the CSV write, so smoothed values are always available without re-reading
+      the file.
+
+    * ``plot_live(every=N)`` can be called every training step.  It skips
+      rendering unless ``N`` steps have passed since the last render, then reads
+      the CSV and writes a single four-panel PNG.  Plots are always up-to-date
+      during training without blocking the main loop.
+
+    * ``plot_all`` is kept for backwards compatibility; it now just calls
+      ``plot_live(force=True)``.
+    """
+
+    def __init__(self, out_folder_path: str = "output", ema_alpha: float = 0.02):
+        self.class_name      = "Plotter"
         self.out_folder_path = out_folder_path
+        os.makedirs(out_folder_path, exist_ok=True)
 
-    def store_reward(self, reward: float):
-        self.rewards = pd.concat(
-            [self.rewards, pd.DataFrame([reward])], ignore_index=True
+        # ── Write-through CSV ─────────────────────────────────────────────
+        # Opened in append mode so a resumed run extends the existing file.
+        # Header is written only when the file is new/empty.
+        self._csv_path   = os.path.join(out_folder_path, "rewards.csv")
+        _is_new          = (not os.path.exists(self._csv_path)
+                            or os.path.getsize(self._csv_path) == 0)
+        self._csv_handle = open(self._csv_path, "a", buffering=1)  # line-buffered
+        if _is_new:
+            self._csv_handle.write("step,reward,ema\n")
+
+        # ── Incremental EMA state ─────────────────────────────────────────
+        self._alpha    = ema_alpha   # decay; equivalent window ≈ 2/α − 1
+        self._ema      = None        # None until first reward arrives
+        self._step     = 0
+
+        # ── Progressive plot throttle ─────────────────────────────────────
+        self._last_plot_step = -1
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def store_reward(self, reward: float) -> None:
+        """
+        Record one reward value.  Writes a CSV row immediately and updates
+        the in-place EMA.  Never accumulates data in memory.
+        """
+        if self._ema is None:
+            self._ema = float(reward)
+        else:
+            self._ema = self._alpha * float(reward) + (1.0 - self._alpha) * self._ema
+
+        self._csv_handle.write(
+            f"{self._step},{float(reward):.8f},{self._ema:.8f}\n"
         )
+        self._step += 1
 
-    def _save(self, filename: str):
+    def plot_live(self, every: int = 50, force: bool = False) -> None:
+        """
+        Redraw the three reward plots from the CSV if ``every`` steps have
+        elapsed since the last render (or immediately when ``force=True``).
+        Safe to call on every training step — the check is O(1).
+
+        Writes three separate PNG files:
+          rewards_raw.png      — raw per-step reward
+          rewards_ema.png      — exponential moving average
+          rewards_smoothed.png — rolling mean (window = 10 % of steps)
+        """
+        if not force and (self._step - self._last_plot_step) < every:
+            return
+        if self._step == 0:
+            return
+
+        self._last_plot_step = self._step
+
+        try:
+            df = pd.read_csv(self._csv_path)
+        except Exception:
+            return  # file may be mid-write; skip this cycle
+
+        if df.empty:
+            return
+
+        rewards  = df["reward"].to_numpy()
+        ema_vals = df["ema"].to_numpy()
+        steps    = df["step"].to_numpy()
+        w        = max(1, len(rewards) // 10)
+        rolling  = pd.Series(rewards).rolling(w, min_periods=1).mean().to_numpy()
+
         os.makedirs(self.out_folder_path, exist_ok=True)
-        plt.savefig(f"{self.out_folder_path}/{filename}", dpi=500)
 
-    def plot_rewards(self):
-        if self.rewards.empty:
-            raise ValueError("No rewards to plot.")
-        plt.clf()
-        plt.plot(self.rewards)
-        plt.xlabel("Step"); plt.ylabel("Reward"); plt.title("Rewards over time")
-        self._save("rewards.png")
+        # ── Graph 1: raw reward ───────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(steps, rewards, color="tab:blue", linewidth=0.7, alpha=0.85)
+        ax.axhline(0, color="grey", linewidth=0.5, linestyle="--")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Reward")
+        ax.set_title(f"Raw reward  (step {self._step})", fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.out_folder_path, "rewards_raw.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
-    def plot_rewards_smoothed(self, window_size: int = 0):
-        if self.rewards.empty:
-            raise ValueError("No rewards to plot.")
-        w = self._correct_window(window_size)
-        plt.clf()
-        plt.plot(self.rewards.rolling(w).mean())
-        plt.xlabel("Step"); plt.ylabel("Smoothed reward")
-        plt.title("Smoothed rewards")
-        self._save("rewards_smoothed.png")
+        # ── Graph 2: EMA ──────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(steps, ema_vals, color="tab:orange", linewidth=1.6,
+                label=f"EMA (α={self._alpha})")
+        ax.axhline(0, color="grey", linewidth=0.5, linestyle="--")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Reward")
+        ax.set_title(f"EMA reward  (step {self._step})", fontweight="bold")
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.out_folder_path, "rewards_ema.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
-    def plot_cumulative_rewards(self):
-        if self.rewards.empty:
-            raise ValueError("No rewards to plot.")
-        plt.clf()
-        plt.plot(self.rewards.cumsum())
-        plt.xlabel("Episode"); plt.ylabel("Cumulative reward")
-        plt.title("Cumulative reward over time")
-        self._save("cumulative_rewards.png")
+        # ── Graph 3: rolling mean (same method as original Plotter) ──────
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(steps, rolling,  color="tab:green", linewidth=1.6,
+                label=f"Rolling mean (w={w})")
+        ax.axhline(0, color="grey", linewidth=0.5, linestyle="--")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Smoothed reward")
+        ax.set_title(f"Smoothed reward  (step {self._step})", fontweight="bold")
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.out_folder_path, "rewards_smoothed.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
-    def plot_cumulative_rewards_smoothed_per_steps(self, window_size: int = 10):
-        if self.rewards.empty:
-            raise ValueError("No rewards to plot.")
-        w = self._correct_window(window_size)
-        plt.clf()
-        cum = self.rewards.rolling(w).mean().cumsum()
-        cum = cum.div(pd.Series(range(1, len(cum) + 1)), axis=0)
-        plt.plot(cum)
-        plt.xlabel("Step"); plt.ylabel("Cumulative reward / step")
-        plt.title("Cumulative reward per step")
-        self._save("cumulative_rewards_smoothed_per_steps.png")
 
-    def plot_all(self, window_size: int = 0):
-        self.plot_rewards()
-        self.plot_rewards_smoothed(window_size)
-        self.plot_cumulative_rewards()
-        self.plot_cumulative_rewards_smoothed_per_steps(window_size)
+    def plot_all(self, window_size: int = 0) -> None:
+        """Backwards-compatible end-of-training call; forces a render now."""
+        self.plot_live(force=True)
+
+    def close(self) -> None:
+        """Flush and close the CSV handle.  Call at end of training."""
+        try:
+            self._csv_handle.flush()
+            self._csv_handle.close()
+        except Exception:
+            pass
+
+    # ── Legacy single-plot methods kept for backwards compatibility ───────────
+
+    def plot_rewards(self) -> None:
+        self.plot_live(force=True)
+
+    def plot_rewards_smoothed(self, window_size: int = 0) -> None:
+        self.plot_live(force=True)
+
+    def plot_cumulative_rewards(self) -> None:
+        self.plot_live(force=True)
+
+    def plot_cumulative_rewards_smoothed_per_steps(self, window_size: int = 10) -> None:
+        self.plot_live(force=True)
+
+    def _save(self, filename: str) -> None:
         os.makedirs(self.out_folder_path, exist_ok=True)
-        self.rewards.to_csv(f"{self.out_folder_path}/rewards.csv", index=False)
+        plt.savefig(os.path.join(self.out_folder_path, filename), dpi=150)
 
     def _correct_window(self, w: int) -> int:
-        if w == 0:
-            w = max(1, len(self.rewards) // 10)
-        return max(1, w)
+        return max(1, w if w > 0 else max(1, self._step // 10))

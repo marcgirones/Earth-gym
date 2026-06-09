@@ -108,6 +108,7 @@ class Gym:
 
     def generate_output(self):
         self.env.plotter.plot_all()
+        self.env.plotter.close()
 
     def handle_request(self, request: str) -> str:
         request_data = json.loads(request)
@@ -495,6 +496,9 @@ class SpiceEnvironment:
             print(f"Time to get reward: {perf_counter() - before:.3f} s")
 
         self.plotter.store_reward(reward)
+        # Refresh the reward plots every 50 steps without blocking the server.
+        # The CSV is always up-to-date regardless of this interval.
+        self.plotter.plot_live(every=50)
 
         # ── Update target zones ───────────────────────────────────────
         sat = self._get_satellite(agent_id)

@@ -170,7 +170,7 @@ device     = (
     else torch.device("cpu")
 )
 num_cells      = 256
-lr             = 1e-3
+lr             = 7e-5
 max_grad_norm  = 1.0
 
 ## MODIFICATION 2 — Reduce frames_per_batch and total_frames for Earth-Gym
@@ -188,7 +188,7 @@ max_grad_norm  = 1.0
 # Increase total_frames once you confirm the training loop runs correctly.
 #
 frames_per_batch = 64
-total_frames     = 300_000
+total_frames     = 500_000
 
 sub_batch_size = 16    # reduced from 64 — Earth-Gym batches are smaller
 num_epochs     = 10

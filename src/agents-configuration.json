@@ -14,12 +14,12 @@
     },
     "reward_metrics": {
         "min_duration": 4,
-        "reobs_decay": 2,
+        "reobs_decay": 4,
         "zenith_weight": 1,
-        "priority_weight": 1,
+        "priority_weight": 2,
         "grid_weight": 0.05,
         "grid_decay": 30,
-        "slew_weight": 0.00005
+        "slew_weight": 0.0005
     },
     "agents": [
         {
